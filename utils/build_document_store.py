@@ -83,7 +83,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--format",
         choices=["plain", "markdown", "json"],
-        default="plain",
+        default="json",
         help="Format to parse PDF files into",
     )
     parser.add_argument(
