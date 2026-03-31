@@ -25,6 +25,7 @@ import asyncio
 import codecs
 import json
 import re
+import time
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
@@ -39,6 +40,7 @@ from llama_index.core.vector_stores import (
     FilterCondition,
     MetadataFilters,
 )
+from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient
@@ -56,6 +58,7 @@ RESULTS_MAX = 20
 # Other reranker settings:
 RERANKER_TEMPERATURE = 0
 RERANKER_MAX_TOKENS = 64
+DEBUG = True
 
 
 class DeepInfraReranker(BaseNodePostprocessor):
@@ -142,11 +145,79 @@ class DeepInfraReranker(BaseNodePostprocessor):
         return reranked_nodes
 
 
+class EmbedRerankReranker(BaseNodePostprocessor):
+    """
+    Reranker using an embed-rerank service (/api/v1/rerank).
+    """
+
+    top_n: int = Field(description="Number of top results to return")
+    base_url: str = Field(description="Base URL of the embed-rerank service")
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "EmbedRerankReranker"
+
+    def _postprocess_nodes(
+        self,
+        nodes: list[NodeWithScore],
+        query_bundle: Optional[QueryBundle] = None,
+    ) -> list[NodeWithScore]:
+        raise NotImplementedError
+
+    async def _apostprocess_nodes(
+        self,
+        nodes: list[NodeWithScore],
+        query_bundle: Optional[QueryBundle] = None,
+    ) -> list[NodeWithScore]:
+        """
+        Rerank nodes using embed-rerank /api/v1/rerank endpoint.
+        """
+        if not nodes:
+            return []
+
+        query_str = getattr(query_bundle, "query_str", "")
+        if not query_str:
+            return nodes[: self.top_n]
+
+        documents = [node.get_content() for node in nodes]
+
+        url = f"{self.base_url.rstrip('/')}/api/v1/rerank"
+        payload = {
+            "query": query_str,
+            "documents": documents,
+            "top_n": self.top_n,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                if not response.ok:
+                    error_text = await response.text()
+                    raise RuntimeError(
+                        f"Embed-rerank API error (status {response.status}): {error_text}"
+                    )
+                result = await response.json()
+
+        results = result.get("results", [])
+
+        # Build reranked node list preserving original node objects
+        reranked_nodes = []
+        for item in results:
+            idx = item.get("index", 0)
+            score = item.get("relevance_score", 0.0)
+            if 0 <= idx < len(nodes):
+                node = nodes[idx]
+                node.score = score
+                reranked_nodes.append(node)
+
+        return reranked_nodes
+
+
 def get_embedding_model(
     embedding_model_name: str,
     embedding_query_instruction: Optional[str] = None,
     ollama_base_url: Optional[str] = None,
     deepinfra_api_key: Optional[str] = None,
+    embed_rerank_url: Optional[str] = None,
 ) -> BaseEmbedding:
     """
     Initialize and return the model for embedding.
@@ -158,7 +229,14 @@ def get_embedding_model(
         ).strip()
     else:
         query_instruction = None
-    if ollama_base_url:
+    if embed_rerank_url:
+        return OpenAIEmbedding(
+            model_name=embedding_model_name,
+            api_key="not-needed",
+            api_base=f"{embed_rerank_url.rstrip('/')}/v1",
+            query_instruction=query_instruction,
+        )
+    elif ollama_base_url:
         from llama_index.embeddings.ollama import OllamaEmbedding
 
         return OllamaEmbedding(
@@ -188,11 +266,14 @@ def get_reranker(
     reranker_model_name: str,
     ollama_base_url: Optional[str] = None,
     deepinfra_api_key: Optional[str] = None,
+    embed_rerank_url: Optional[str] = None,
 ) -> BaseNodePostprocessor:
     """
     Initialize and return the model for reranking.
     """
-    if ollama_base_url:
+    if embed_rerank_url:
+        return EmbedRerankReranker(top_n=top_n, base_url=embed_rerank_url)
+    elif ollama_base_url:
         from llama_index.llms.ollama import Ollama
 
         llm = Ollama(
@@ -226,6 +307,7 @@ def get_vector_index(
     ollama_base_url: Optional[str] = None,
     deepinfra_api_key: Optional[str] = None,
     qdrant_api_key: Optional[str] = None,
+    embed_rerank_url: Optional[str] = None,
 ) -> VectorStoreIndex:
     """
     Initialize and return the VectorStoreIndex object.
@@ -252,6 +334,7 @@ def get_vector_index(
         embedding_query_instruction=embedding_query_instruction,
         ollama_base_url=ollama_base_url,
         deepinfra_api_key=deepinfra_api_key,
+        embed_rerank_url=embed_rerank_url,
     )
 
     # Create the index object from the existing vector store.
@@ -422,6 +505,10 @@ class Tools:
             default=None,
             description="API key for DeepInfra. When set, uses DeepInfra instead of downloading the embedding/reranker models from HuggingFace.",
         )
+        embed_rerank_url: Optional[str] = Field(
+            default=None,
+            description="URL for embed-rerank service (e.g., http://localhost:9000). When set, uses it for both embedding (/v1/embeddings) and reranking (/api/v1/rerank).",
+        )
 
     def __init__(self) -> None:
         """
@@ -481,6 +568,8 @@ class Tools:
         filter_desc = f" in {file_name}" if file_name else ""
         await emit_status(f"Searching{filter_desc} for: {query}")
 
+        t_query_start = time.time()
+
         try:
             # Cache and reuse the VectorStoreIndex object.
             # Lock required to prevent concurrent requests from closing/recreating
@@ -488,6 +577,8 @@ class Tools:
             async with self._lock:
                 current_config = self.valves.model_dump_json()
                 if not self._index or self._last_config != current_config:
+                    if DEBUG:
+                        t0 = time.time()
                     if self._index:
                         await self._index.vector_store._aclient.close()
                     self._index = get_vector_index(
@@ -498,8 +589,11 @@ class Tools:
                         ollama_base_url=self.valves.ollama_base_url,
                         deepinfra_api_key=self.valves.deepinfra_api_key,
                         qdrant_api_key=self.valves.qdrant_api_key,
+                        embed_rerank_url=self.valves.embed_rerank_url,
                     )
                     self._last_config = current_config
+                    if DEBUG:
+                        print(f"[DEBUG] Index init: {time.time() - t0:.2f}s")
 
             # Determine number of candidates to retrieve if reranking.
             if self.valves.reranker_model:
@@ -518,7 +612,14 @@ class Tools:
                 use_async=True,
             )
 
+            if DEBUG:
+                t0 = time.time()
             nodes = await retriever.aretrieve(query)
+            if DEBUG:
+                print(
+                    f"[DEBUG] Retrieve: {time.time() - t0:.2f}s, "
+                    f"{len(nodes)} candidates"
+                )
 
             # Rerank if reranker model is configured.
             if self.valves.reranker_model and nodes:
@@ -530,8 +631,15 @@ class Tools:
                     reranker_model_name=self.valves.reranker_model,
                     ollama_base_url=self.valves.ollama_base_url,
                     deepinfra_api_key=self.valves.deepinfra_api_key,
+                    embed_rerank_url=self.valves.embed_rerank_url,
                 )
+                if DEBUG:
+                    t0 = time.time()
                 nodes = await ranker.apostprocess_nodes(nodes, query_str=query)
+                if DEBUG:
+                    print(
+                        f"[DEBUG] Rerank: {time.time() - t0:.2f}s, {len(nodes)} results"
+                    )
 
             if nodes:
                 await emit_status("Search complete.", done=True, hidden=True)
@@ -560,6 +668,10 @@ class Tools:
                 )
                 if citation_id:
                     documents.append(clean_node(node, citation_id=citation_id))
+
+            if DEBUG:
+                elapsed = time.time() - t_query_start
+                print(f"[DEBUG] Total query: {elapsed:.2f}s")
 
             return json.dumps(documents)
 
