@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
-import codecs
 import os
+import re
 from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Never
+from datetime import datetime, timedelta, timezone
+from typing import Never, Optional
 from urllib.parse import urlparse
 
 from llama_index.core import (
@@ -14,9 +14,9 @@ from llama_index.core import (
     StorageContext,
     VectorStoreIndex,
 )
-from llama_index.core.constants import DEFAULT_CHUNK_SIZE
 from llama_index.core.node_parser import MarkdownNodeParser, SentenceSplitter
 from llama_index.core.utils import get_tokenizer
+from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient, models
 from tqdm import tqdm
@@ -31,6 +31,58 @@ ALLOWED_EXTENSIONS = [
     ".pdf",
     ".txt",
 ]
+
+
+def parse_pdf_date(pdf_date_str: str) -> Optional[str]:
+    """Parse PDF internal date format D:YYYYMMDDHHmmSS±HH'mm' to YYYY-MM-DD UTC."""
+    match = re.match(
+        r"D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?([+\-Z])?(\d{2})?'?(\d{2})?",
+        pdf_date_str,
+    )
+    if not match or not match.group(2) or not match.group(3):
+        return None
+    year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    hour = int(match.group(4) or 0)
+    minute = int(match.group(5) or 0)
+    tz_sign = match.group(7)
+    tz_hour = int(match.group(8) or 0)
+    tz_min = int(match.group(9) or 0)
+    try:
+        dt = datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+        if tz_sign == "+":
+            dt = dt - timedelta(hours=tz_hour, minutes=tz_min)
+        elif tz_sign == "-":
+            dt = dt + timedelta(hours=tz_hour, minutes=tz_min)
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def get_file_internal_date(file_path: str) -> Optional[str]:
+    """Extract modification date from file internal metadata."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        try:
+            import fitz
+
+            doc = fitz.open(file_path)
+            mod_date = doc.metadata.get("modDate")
+            doc.close()
+            if mod_date:
+                return parse_pdf_date(mod_date)
+        except Exception:
+            pass
+    elif ext == ".docx":
+        try:
+            import docx
+
+            document = docx.Document(file_path)
+            modified = document.core_properties.modified
+            if modified:
+                return modified.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return None
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -61,24 +113,18 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--embedding-model",
-        default="sentence-transformers/all-MiniLM-L6-v2",
+        default="mlx-community/Qwen3-Embedding-4B-4bit-DWQ",
         help="Model for dense vector embeddings",
     )
     parser.add_argument(
         "--embedding-text-instruction",
         default=None,
-        help="Instruction to prepend to text before embedding, e.g., 'passage:'. Escape sequences like \\n are interpreted.",
+        help="Instruction to prepend to text before embedding, e.g., 'passage:'.",
     )
-    provider_group = parser.add_mutually_exclusive_group()
-    provider_group.add_argument(
-        "--ollama-base-url",
-        default=None,
-        help="Base URL for Ollama API. When set, uses Ollama instead of downloading the embedding model from HuggingFace.",
-    )
-    provider_group.add_argument(
-        "--deepinfra-api-key",
-        default=None,
-        help="API key for DeepInfra. When set, uses DeepInfra instead of downloading the embedding model from HuggingFace.",
+    parser.add_argument(
+        "--embed-rerank-url",
+        default="http://localhost:9000",
+        help="URL for embed-rerank service for embeddings (/api/v1/embed)",
     )
     parser.add_argument(
         "--format",
@@ -96,6 +142,12 @@ def parse_arguments() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Compare files between input directory and Qdrant collection without actually adding or deleting documents",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=512,
+        help="Maximum chunk size for document splitting",
     )
 
     return parser.parse_args()
@@ -207,10 +259,17 @@ def get_filesystem_files(input_dir: str) -> dict[str, dict]:
             if file_extension in ALLOWED_EXTENSIONS:
                 file_path = os.path.abspath(os.path.join(root, file))
                 stat = os.stat(file_path)
-                timestamp_dt = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                internal_date = get_file_internal_date(file_path)
+                if internal_date:
+                    last_modified_date = internal_date
+                else:
+                    timestamp_dt = datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    )
+                    last_modified_date = timestamp_dt.strftime("%Y-%m-%d")
                 filesystem_files[file_path] = {
                     "file_size": stat.st_size,
-                    "last_modified_date": timestamp_dt.strftime("%Y-%m-%d"),
+                    "last_modified_date": last_modified_date,
                 }
 
     return dict(sorted(filesystem_files.items(), key=lambda item: item[0]))
@@ -351,7 +410,7 @@ def build_document_store(args: argparse.Namespace) -> None:
                 chunker=HybridChunker(
                     tokenizer=OpenAITokenizer(
                         tokenizer=get_tokenizer().func.__self__,
-                        max_tokens=DEFAULT_CHUNK_SIZE,
+                        max_tokens=args.chunk_size,
                     ),
                 )
             )
@@ -360,40 +419,16 @@ def build_document_store(args: argparse.Namespace) -> None:
         raise NotImplementedError
 
     if args.embedding_text_instruction:
-        # Interpret escape sequences, e.g., literal '\n' into an actual newline.
-        text_instruction = str(
-            codecs.decode(args.embedding_text_instruction, "unicode_escape", "strict")
-        ).strip()
+        text_instruction = str(args.embedding_text_instruction).strip()
     else:
         text_instruction = None
 
-    # Initialize embedding model
-    if args.ollama_base_url:
-        from llama_index.embeddings.ollama import OllamaEmbedding
-
-        embed_model = OllamaEmbedding(
-            model_name=args.embedding_model,
-            base_url=args.ollama_base_url,
-            text_instruction=text_instruction,
-            num_workers=args.workers,
-        )
-    elif args.deepinfra_api_key:
-        from llama_index.embeddings.deepinfra import DeepInfraEmbeddingModel
-
-        embed_model = DeepInfraEmbeddingModel(
-            model_id=args.embedding_model,
-            api_token=args.deepinfra_api_key,
-            text_prefix=text_instruction + " " if text_instruction else "",
-        )
-        embed_model.num_workers = args.workers
-    else:
-        from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-
-        embed_model = HuggingFaceEmbedding(
-            model_name=args.embedding_model,
-            text_instruction=text_instruction,
-            num_workers=args.workers,
-        )
+    embed_model = OpenAIEmbedding(
+        model_name=args.embedding_model,
+        api_key="not-needed",
+        api_base=f"{args.embed_rerank_url.rstrip('/')}/v1",
+        text_instruction=text_instruction,
+    )
 
     # Initialize Qdrant client and vector store
     parsed_url = urlparse(args.qdrant_url, scheme="file")
@@ -501,10 +536,7 @@ def build_document_store(args: argparse.Namespace) -> None:
     print(f"Qdrant URL: {args.qdrant_url}")
     print(f"Qdrant Collection: {args.qdrant_collection}")
     print(f"Embedding Model: {args.embedding_model}")
-    if args.ollama_base_url:
-        print(f"Ollama Base URL: {args.ollama_base_url}")
-    elif args.deepinfra_api_key:
-        print("Using DeepInfra API")
+    print(f"Embed-Rerank URL: {args.embed_rerank_url}")
 
 
 def main() -> None:

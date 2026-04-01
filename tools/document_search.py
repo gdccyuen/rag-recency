@@ -19,9 +19,11 @@ license: AGPL-3.0-or-later
 
 import asyncio
 import json
+import math
 import re
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -49,6 +51,10 @@ CANDIDATES_MAX = 100
 RESULTS_MIN = 1
 RESULTS_DEFAULT = 5
 RESULTS_MAX = 50
+
+# Recency weighting:
+RECENCY_ALPHA = 0.3
+RECENCY_HALFLIFE_DAYS = 365.0
 
 DEBUG = True
 
@@ -118,6 +124,65 @@ class EmbedRerankReranker(BaseNodePostprocessor):
                 reranked_nodes.append(node)
 
         return reranked_nodes
+
+
+class RecencyBooster(BaseNodePostprocessor):
+    """Applies Gaussian decay based on document age to reranked scores."""
+
+    halflife_days: float = Field(
+        description="Half-life in days for Gaussian recency decay"
+    )
+    reference_date: Optional[datetime] = Field(default=None)
+    debug: bool = Field(default=False)
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "RecencyBooster"
+
+    def _postprocess_nodes(
+        self,
+        nodes: list[NodeWithScore],
+        query_bundle: Optional[QueryBundle] = None,
+    ) -> list[NodeWithScore]:
+        raise NotImplementedError
+
+    async def _apostprocess_nodes(
+        self,
+        nodes: list[NodeWithScore],
+        query_bundle: Optional[QueryBundle] = None,
+    ) -> list[NodeWithScore]:
+        if not nodes:
+            return []
+
+        ref = self.reference_date or datetime.now(timezone.utc)
+
+        for node in nodes:
+            date_str = node.metadata.get("last_modified_date")
+            if date_str:
+                try:
+                    doc_date = datetime.strptime(date_str, "%Y-%m-%d").replace(
+                        tzinfo=timezone.utc
+                    )
+                    age_days = max(0.0, (ref - doc_date).total_seconds() / 86400.0)
+                    weight = math.exp(-0.5 * (age_days / self.halflife_days) ** 2)
+                    original_score = node.score
+                    node.score = (
+                        original_score * (1 - RECENCY_ALPHA)
+                        + original_score * weight * RECENCY_ALPHA
+                    )
+
+                    if self.debug:
+                        file_name = node.metadata.get("file_name", "unknown")
+                        print(
+                            f"[RECENCY] {file_name:40s} | date={date_str} | age={age_days:7.1f}d "
+                            f"| weight={weight:.4f} | rerank_score={original_score:.4f} "
+                            f"| final_score={node.score:.4f}"
+                        )
+                except (ValueError, TypeError):
+                    pass
+
+        nodes.sort(key=lambda n: n.score, reverse=True)
+        return nodes
 
 
 def get_embedding_model(
@@ -365,6 +430,7 @@ class Tools:
         query: str,
         top_k: int = RESULTS_DEFAULT,
         file_name: Optional[str] = None,
+        debug_recency: bool = False,
         __metadata__: Optional[dict[str, Any]] = None,
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
     ) -> str:
@@ -472,6 +538,13 @@ class Tools:
                     print(
                         f"[DEBUG] Rerank: {time.time() - t0:.2f}s, {len(nodes)} results"
                     )
+
+            # Apply recency boost.
+            if nodes:
+                booster = RecencyBooster(
+                    halflife_days=RECENCY_HALFLIFE_DAYS, debug=debug_recency
+                )
+                nodes = await booster.apostprocess_nodes(nodes)
 
             if nodes:
                 await emit_status("Search complete.", done=True, hidden=True)

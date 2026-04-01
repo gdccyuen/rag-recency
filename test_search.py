@@ -14,6 +14,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--top-k", type=int, default=3, help="Number of results to return"
     )
+    parser.add_argument(
+        "--debug", action="store_true", help="Print recency score calculation details"
+    )
     return parser.parse_args()
 
 
@@ -33,7 +36,9 @@ async def main() -> None:
     print(f"Top-k: {args.top_k}")
     print()
 
-    result = await tool.retrieve_documents(args.query, top_k=args.top_k)
+    result = await tool.retrieve_documents(
+        args.query, top_k=args.top_k, debug_recency=args.debug
+    )
 
     print()
     try:
