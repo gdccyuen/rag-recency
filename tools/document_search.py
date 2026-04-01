@@ -4,17 +4,13 @@ author: daradib
 author_url: https://github.com/daradib/
 git_url: https://github.com/daradib/openwebui-plugins.git
 description: Retrieves documents from a Qdrant vector store. Supports hybrid search for agentic knowledge base RAG.
-requirements: fastembed, llama-index-embeddings-deepinfra, llama-index-embeddings-ollama, llama-index-llms-ollama, llama-index-vector-stores-qdrant
-version: 0.2.4
+requirements: llama-index-embeddings-openai, llama-index-vector-stores-qdrant
+version: 0.3.0
 license: AGPL-3.0-or-later
 """
 
 
 # Notes:
-#
-# To use HuggingFace SentenceTransformer instead of Ollama or DeepInfra, add
-# "llama-index-embeddings-huggingface, llama-index-llms-huggingface" to the
-# requirements line above.
 #
 # Connection caching and citation indexing use async locking, but assume a
 # single-node/worker (default). If a multi-node/worker deployment of Open WebUI
@@ -22,17 +18,16 @@ license: AGPL-3.0-or-later
 # for state synchronization.
 
 import asyncio
-import codecs
 import json
 import re
 import time
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import aiohttp
 from llama_index.core import QueryBundle, VectorStoreIndex
 from llama_index.core.base.embeddings.base import BaseEmbedding
-from llama_index.core.postprocessor.llm_rerank import LLMRerank
 from llama_index.core.postprocessor.types import BaseNodePostprocessor
 from llama_index.core.schema import NodeWithScore
 from llama_index.core.vector_stores import (
@@ -53,101 +48,14 @@ CANDIDATES_MAX = 100
 # Number of search results:
 RESULTS_MIN = 1
 RESULTS_DEFAULT = 5
-RESULTS_MAX = 20
+RESULTS_MAX = 50
 
-# Other reranker settings:
-RERANKER_TEMPERATURE = 0
-RERANKER_MAX_TOKENS = 64
 DEBUG = True
-
-
-class DeepInfraReranker(BaseNodePostprocessor):
-    """
-    Reranker using DeepInfra's reranking API.
-    """
-
-    top_n: int = Field(description="Number of top results to return")
-    model_id: str = Field(description="DeepInfra reranker model ID")
-    api_token: str = Field(description="DeepInfra API token")
-    instruction: Optional[str] = Field(
-        default=None,
-        description="Instruction for the reranker model",
-    )
-
-    @classmethod
-    def class_name(cls) -> str:
-        return "DeepInfraReranker"
-
-    def _postprocess_nodes(
-        self,
-        nodes: list[NodeWithScore],
-        query_bundle: Optional[QueryBundle] = None,
-    ) -> list[NodeWithScore]:
-        raise NotImplementedError
-
-    async def _apostprocess_nodes(
-        self,
-        nodes: list[NodeWithScore],
-        query_bundle: Optional[QueryBundle] = None,
-    ) -> list[NodeWithScore]:
-        """
-        Rerank nodes using DeepInfra API.
-        """
-        if not nodes:
-            return []
-
-        query_str = getattr(query_bundle, "query_str", "")
-        if not query_str:
-            return nodes[: self.top_n]
-
-        # Prepare documents for reranking
-        documents = [node.get_content() for node in nodes]
-        queries = [query_str] * len(documents)
-
-        # Call DeepInfra API
-        url = f"https://api.deepinfra.com/v1/inference/{self.model_id}"
-        headers = {
-            "Authorization": f"bearer {self.api_token}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "queries": queries,
-            "documents": documents,
-        }
-        if self.instruction:
-            payload["instruction"] = self.instruction
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload) as response:
-                if not response.ok:
-                    error_text = await response.text()
-                    raise RuntimeError(
-                        f"DeepInfra API error (status {response.status}): {error_text}"
-                    )
-                result = await response.json()
-
-        scores = result.get("scores", [])
-        if len(scores) != len(nodes):
-            raise RuntimeError(
-                f"DeepInfra returned {len(scores)} scores for {len(nodes)} documents"
-            )
-
-        # Pair nodes with scores and sort by score (descending)
-        scored_nodes = list(zip(nodes, scores))
-        scored_nodes.sort(key=lambda x: x[1], reverse=True)
-
-        # Return top_n nodes with updated scores
-        reranked_nodes = []
-        for node, score in scored_nodes[: self.top_n]:
-            node.score = score
-            reranked_nodes.append(node)
-
-        return reranked_nodes
 
 
 class EmbedRerankReranker(BaseNodePostprocessor):
     """
-    Reranker using an embed-rerank service (/api/v1/rerank).
+    Reranker using an embed-rerank service (/v1/openai/rerank).
     """
 
     top_n: int = Field(description="Number of top results to return")
@@ -170,7 +78,7 @@ class EmbedRerankReranker(BaseNodePostprocessor):
         query_bundle: Optional[QueryBundle] = None,
     ) -> list[NodeWithScore]:
         """
-        Rerank nodes using embed-rerank /api/v1/rerank endpoint.
+        Rerank nodes using embed-rerank /v1/openai/rerank endpoint.
         """
         if not nodes:
             return []
@@ -179,9 +87,9 @@ class EmbedRerankReranker(BaseNodePostprocessor):
         if not query_str:
             return nodes[: self.top_n]
 
-        documents = [node.get_content() for node in nodes]
+        documents = [node.get_content()[:4096] for node in nodes]
 
-        url = f"{self.base_url.rstrip('/')}/api/v1/rerank"
+        url = f"{self.base_url.rstrip('/')}/v1/openai/rerank"
         payload = {
             "query": query_str,
             "documents": documents,
@@ -197,13 +105,13 @@ class EmbedRerankReranker(BaseNodePostprocessor):
                     )
                 result = await response.json()
 
-        results = result.get("results", [])
+        results = result.get("data", [])
 
         # Build reranked node list preserving original node objects
         reranked_nodes = []
         for item in results:
             idx = item.get("index", 0)
-            score = item.get("relevance_score", 0.0)
+            score = item.get("score", item.get("relevance_score", 0.0))
             if 0 <= idx < len(nodes):
                 node = nodes[idx]
                 node.score = score
@@ -214,100 +122,41 @@ class EmbedRerankReranker(BaseNodePostprocessor):
 
 def get_embedding_model(
     embedding_model_name: str,
-    embedding_query_instruction: Optional[str] = None,
-    ollama_base_url: Optional[str] = None,
-    deepinfra_api_key: Optional[str] = None,
-    embed_rerank_url: Optional[str] = None,
+    embedding_query_instruction: Optional[str],
+    embed_rerank_url: str,
 ) -> BaseEmbedding:
     """
     Initialize and return the model for embedding.
     """
     if embedding_query_instruction:
-        # Interpret escape sequences, e.g., literal '\n' into an actual newline.
-        query_instruction = str(
-            codecs.decode(embedding_query_instruction, "unicode_escape")
-        ).strip()
+        query_instruction = str(embedding_query_instruction).strip()
     else:
         query_instruction = None
-    if embed_rerank_url:
-        return OpenAIEmbedding(
-            model_name=embedding_model_name,
-            api_key="not-needed",
-            api_base=f"{embed_rerank_url.rstrip('/')}/v1",
-            query_instruction=query_instruction,
-        )
-    elif ollama_base_url:
-        from llama_index.embeddings.ollama import OllamaEmbedding
-
-        return OllamaEmbedding(
-            model_name=embedding_model_name,
-            base_url=ollama_base_url,
-            query_instruction=query_instruction,
-        )
-    elif deepinfra_api_key:
-        from llama_index.embeddings.deepinfra import DeepInfraEmbeddingModel
-
-        return DeepInfraEmbeddingModel(
-            model_id=embedding_model_name,
-            api_token=deepinfra_api_key,
-            query_prefix=query_instruction + " " if query_instruction else "",
-        )
-    else:
-        from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-
-        return HuggingFaceEmbedding(
-            model_name=embedding_model_name,
-            query_instruction=query_instruction,
-        )
+    return OpenAIEmbedding(
+        model_name=embedding_model_name,
+        api_key="not-needed",
+        api_base=f"{embed_rerank_url.rstrip('/')}/v1",
+        query_instruction=query_instruction,
+    )
 
 
 def get_reranker(
     top_n: int,
-    reranker_model_name: str,
-    ollama_base_url: Optional[str] = None,
-    deepinfra_api_key: Optional[str] = None,
-    embed_rerank_url: Optional[str] = None,
+    embed_rerank_url: str,
 ) -> BaseNodePostprocessor:
     """
-    Initialize and return the model for reranking.
+    Initialize and return the reranker.
     """
-    if embed_rerank_url:
-        return EmbedRerankReranker(top_n=top_n, base_url=embed_rerank_url)
-    elif ollama_base_url:
-        from llama_index.llms.ollama import Ollama
-
-        llm = Ollama(
-            model=reranker_model_name,
-            base_url=ollama_base_url,
-            temperature=RERANKER_TEMPERATURE,
-            additional_kwargs={"num_predict": RERANKER_MAX_TOKENS},
-        )
-    elif deepinfra_api_key:
-        return DeepInfraReranker(
-            top_n=top_n,
-            model_id=reranker_model_name,
-            api_token=deepinfra_api_key,
-        )
-    else:
-        from llama_index.llms.huggingface import HuggingFaceLLM
-
-        llm = HuggingFaceLLM(
-            model_name=reranker_model_name,
-            max_new_tokens=RERANKER_MAX_TOKENS,
-            generate_kwargs={"temperature": RERANKER_TEMPERATURE},
-        )
-    return LLMRerank(top_n=top_n, llm=llm)
+    return EmbedRerankReranker(top_n=top_n, base_url=embed_rerank_url)
 
 
 def get_vector_index(
     qdrant_url: str,
     qdrant_collection_name: str,
     embedding_model: str,
-    embedding_query_instruction: Optional[str] = None,
-    ollama_base_url: Optional[str] = None,
-    deepinfra_api_key: Optional[str] = None,
-    qdrant_api_key: Optional[str] = None,
-    embed_rerank_url: Optional[str] = None,
+    embedding_query_instruction: Optional[str],
+    qdrant_api_key: Optional[str],
+    embed_rerank_url: str,
 ) -> VectorStoreIndex:
     """
     Initialize and return the VectorStoreIndex object.
@@ -332,8 +181,6 @@ def get_vector_index(
     embed_model = get_embedding_model(
         embedding_model_name=embedding_model,
         embedding_query_instruction=embedding_query_instruction,
-        ollama_base_url=ollama_base_url,
-        deepinfra_api_key=deepinfra_api_key,
         embed_rerank_url=embed_rerank_url,
     )
 
@@ -486,28 +333,20 @@ class Tools:
             description="API key for remote Qdrant instance.",
         )
         embedding_model: str = Field(
-            default="sentence-transformers/all-MiniLM-L6-v2",
+            default="mlx-community/Qwen3-Embedding-4B-4bit-DWQ",
             description="Model for query embeddings, which should match the model used to create the text embeddings.",
         )
         embedding_query_instruction: Optional[str] = Field(
             default=None,
-            description="Instruction to prepend to query before embedding, e.g., 'query:'. Escape sequences like \\n are interpreted.",
+            description="Instruction to prepend to query before embedding, e.g., 'query:'.",
         )
         reranker_model: Optional[str] = Field(
-            default=None,
+            default="vserifsaglam/Qwen3-Reranker-4B-4bit-MLX",
             description="Model for reranking search results. When set, retrieves more candidates to improve quality.",
         )
-        ollama_base_url: Optional[str] = Field(
-            default=None,
-            description="Base URL for Ollama API. When set, uses Ollama instead of downloading the embedding/reranker models from HuggingFace.",
-        )
-        deepinfra_api_key: Optional[str] = Field(
-            default=None,
-            description="API key for DeepInfra. When set, uses DeepInfra instead of downloading the embedding/reranker models from HuggingFace.",
-        )
-        embed_rerank_url: Optional[str] = Field(
-            default=None,
-            description="URL for embed-rerank service (e.g., http://localhost:9000). When set, uses it for both embedding (/v1/embeddings) and reranking (/api/v1/rerank).",
+        embed_rerank_url: str = Field(
+            default="http://localhost:9000",
+            description="URL for embed-rerank service. Uses /api/v1/embed for embedding and /api/v1/rerank for reranking.",
         )
 
     def __init__(self) -> None:
@@ -516,8 +355,6 @@ class Tools:
         Disables automatic citation handling to allow for custom citation events.
         """
         self.valves = self.Valves()
-        if self.valves.ollama_base_url and self.valves.deepinfra_api_key:
-            raise ValueError("Do not set both Ollama base URL and DeepInfra API key")
         self.citation = False
         self._index = None
         self._last_config = None
@@ -586,8 +423,6 @@ class Tools:
                         qdrant_collection_name=self.valves.qdrant_collection_name,
                         embedding_model=self.valves.embedding_model,
                         embedding_query_instruction=self.valves.embedding_query_instruction,
-                        ollama_base_url=self.valves.ollama_base_url,
-                        deepinfra_api_key=self.valves.deepinfra_api_key,
                         qdrant_api_key=self.valves.qdrant_api_key,
                         embed_rerank_url=self.valves.embed_rerank_url,
                     )
@@ -628,9 +463,6 @@ class Tools:
                 )
                 ranker = get_reranker(
                     top_n=top_k,
-                    reranker_model_name=self.valves.reranker_model,
-                    ollama_base_url=self.valves.ollama_base_url,
-                    deepinfra_api_key=self.valves.deepinfra_api_key,
                     embed_rerank_url=self.valves.embed_rerank_url,
                 )
                 if DEBUG:

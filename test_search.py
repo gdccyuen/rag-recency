@@ -1,41 +1,39 @@
 #!/usr/bin/env python3
 
+import argparse
 import asyncio
 import json
 import sys
 
-sys.path.insert(0, ".")
 from tools.document_search import Tools
 
 
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Test document search tool")
+    parser.add_argument("query", help="Search query string")
+    parser.add_argument(
+        "--top-k", type=int, default=3, help="Number of results to return"
+    )
+    return parser.parse_args()
+
+
 async def main() -> None:
+    args = parse_arguments()
+
     tool = Tools()
 
-    # --embed-rerank flag uses the embed-rerank service for both embed and rerank
-    use_embed_rerank = "--embed-rerank" in sys.argv
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    tool.valves.qdrant_url = "http://localhost:6333"
+    tool.valves.qdrant_collection_name = "ssaskb"
+    tool.valves.embed_rerank_url = "http://localhost:9000"
+    tool.valves.embedding_model = "mlx-community/Qwen3-Embedding-4B-4bit-DWQ"
+    tool.valves.reranker_model = "reranker"
 
-    if use_embed_rerank:
-        tool.valves.qdrant_url = "http://localhost:6333"
-        tool.valves.embed_rerank_url = "http://localhost:9000"
-        tool.valves.embedding_model = "mlx-community/Qwen3-Embedding-4B-4bit-DWQ"
-        tool.valves.reranker_model = "reranker"
-        provider = "embed-rerank (localhost:9000)"
-    else:
-        tool.valves.qdrant_url = "http://localhost:6333"
-        tool.valves.ollama_base_url = "http://localhost:11434"
-        tool.valves.embedding_model = "qwen3-embedding:0.6b"
-        provider = "ollama (localhost:11434)"
-
-    query = args[0] if len(args) > 0 else "what is the application form?"
-    top_k = int(args[1]) if len(args) > 1 else 3
-
-    print(f"Provider: {provider}")
-    print(f"Query: {query}")
-    print(f"Top-k: {top_k}")
+    print("Provider: embed-rerank (localhost:9000)")
+    print(f"Query: {args.query}")
+    print(f"Top-k: {args.top_k}")
     print()
 
-    result = await tool.retrieve_documents(query, top_k=top_k)
+    result = await tool.retrieve_documents(args.query, top_k=args.top_k)
 
     print()
     try:
