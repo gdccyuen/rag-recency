@@ -5,7 +5,7 @@ import os
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Never, Optional
+from typing import Never
 from urllib.parse import urlparse
 
 from llama_index.core import (
@@ -14,12 +14,50 @@ from llama_index.core import (
     StorageContext,
     VectorStoreIndex,
 )
+from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.node_parser import MarkdownNodeParser, SentenceSplitter
 from llama_index.core.utils import get_tokenizer
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient, models
 from tqdm import tqdm
+
+
+class InstructedEmbedding(BaseEmbedding):
+    """Wraps an embedding model to prepend an instruction to text before embedding."""
+
+    _base_model: BaseEmbedding
+    _instruction: str
+
+    def __init__(self, base_model: BaseEmbedding, instruction: str) -> None:
+        super().__init__()
+        object.__setattr__(self, "_base_model", base_model)
+        object.__setattr__(self, "_instruction", instruction)
+
+    def _get_query_embedding(self, query: str) -> list[float]:
+        return self._base_model._get_query_embedding(self._instruction + query)
+
+    async def _aget_query_embedding(self, query: str) -> list[float]:
+        return await self._base_model._aget_query_embedding(self._instruction + query)
+
+    def _get_text_embedding(self, text: str) -> list[float]:
+        return self._base_model._get_text_embedding(self._instruction + text)
+
+    def _get_text_embeddings(self, texts: list[str]) -> list[list[float]]:
+        instructed = [self._instruction + text for text in texts]
+        return self._base_model._get_text_embeddings(instructed)
+
+    async def _aget_text_embedding(self, text: str) -> list[float]:
+        return await self._base_model._aget_text_embedding(self._instruction + text)
+
+    async def _aget_text_embeddings(self, texts: list[str]) -> list[list[float]]:
+        instructed = [self._instruction + text for text in texts]
+        return await self._base_model._aget_text_embeddings(instructed)
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "InstructedEmbedding"
+
 
 # For dependency installation instructions see README.md
 
@@ -33,7 +71,7 @@ ALLOWED_EXTENSIONS = [
 ]
 
 
-def parse_pdf_date(pdf_date_str: str) -> Optional[str]:
+def parse_pdf_date(pdf_date_str: str) -> str | None:
     """Parse PDF internal date format D:YYYYMMDDHHmmSS±HH'mm' to YYYY-MM-DD UTC."""
     match = re.match(
         r"D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?([+\-Z])?(\d{2})?'?(\d{2})?",
@@ -58,7 +96,7 @@ def parse_pdf_date(pdf_date_str: str) -> Optional[str]:
         return None
 
 
-def get_file_internal_date(file_path: str) -> Optional[str]:
+def get_file_internal_date(file_path: str) -> str | None:
     """Extract modification date from file internal metadata."""
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".pdf":
@@ -119,12 +157,17 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--embedding-text-instruction",
         default=None,
-        help="Instruction to prepend to text before embedding, e.g., 'passage:'.",
+        help=(
+            "Instruction to prepend to text before embedding. "
+            'For Qwen3-Embedding, use: "Instruct: Given a query about subsidy scheme, '
+            'application and employment policies, retrieve relevant document passages\\nQuery: " '
+            "(same instruction must be configured in document_search.py via embedding_query_instruction)"
+        ),
     )
     parser.add_argument(
         "--embed-rerank-url",
-        default="http://localhost:9000",
-        help="URL for embed-rerank service for embeddings (/api/v1/embed)",
+        default="http://127.0.0.1:9997",
+        help="URL for xinference service",
     )
     parser.add_argument(
         "--format",
@@ -418,17 +461,17 @@ def build_document_store(args: argparse.Namespace) -> None:
     else:
         raise NotImplementedError
 
-    if args.embedding_text_instruction:
-        text_instruction = str(args.embedding_text_instruction).strip()
-    else:
-        text_instruction = None
-
-    embed_model = OpenAIEmbedding(
+    base_embed_model = OpenAIEmbedding(
         model_name=args.embedding_model,
         api_key="not-needed",
         api_base=f"{args.embed_rerank_url.rstrip('/')}/v1",
-        text_instruction=text_instruction,
     )
+
+    if args.embedding_text_instruction:
+        text_instruction = str(args.embedding_text_instruction).strip()
+        embed_model = InstructedEmbedding(base_embed_model, text_instruction)
+    else:
+        embed_model = base_embed_model
 
     # Initialize Qdrant client and vector store
     parsed_url = urlparse(args.qdrant_url, scheme="file")
@@ -505,7 +548,7 @@ def build_document_store(args: argparse.Namespace) -> None:
             [doc for doc in documents if is_document_custom_extractor(doc)],
             storage_context=storage_context,
             embed_model=embed_model,
-            use_async=bool(vector_store._aclient),
+            use_async=False,
             show_progress=True,
             transformations=transformations,
         )
@@ -513,7 +556,7 @@ def build_document_store(args: argparse.Namespace) -> None:
             [doc for doc in documents if not is_document_custom_extractor(doc)],
             storage_context=storage_context,
             embed_model=embed_model,
-            use_async=bool(vector_store._aclient),
+            use_async=False,
             show_progress=True,
             transformations=default_transformations,
         )
@@ -536,7 +579,7 @@ def build_document_store(args: argparse.Namespace) -> None:
     print(f"Qdrant URL: {args.qdrant_url}")
     print(f"Qdrant Collection: {args.qdrant_collection}")
     print(f"Embedding Model: {args.embedding_model}")
-    print(f"Embed-Rerank URL: {args.embed_rerank_url}")
+    print(f"Xinference URL: {args.embed_rerank_url}")
 
 
 def main() -> None:

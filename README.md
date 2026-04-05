@@ -32,7 +32,7 @@ python3 utils/list_document_store.py [options]
 python3 utils/build_document_store.py Docs/Basic \
   --qdrant-url http://localhost:6333 \
   --qdrant-collection ssaskb \
-  --embed-rerank-url http://localhost:9000 \
+  --embed-rerank-url http://127.0.0.1:9997 \
   --embedding-model mlx-community/Qwen3-Embedding-4B-4bit-DWQ \
   --chunk-size 512
 ```

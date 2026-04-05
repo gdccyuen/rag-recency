@@ -15,6 +15,12 @@ def parse_arguments() -> argparse.Namespace:
         "--top-k", type=int, default=3, help="Number of results to return"
     )
     parser.add_argument(
+        "--mode",
+        choices=["default", "sparse", "hybrid", "semantic_hybrid"],
+        default="hybrid",
+        help="Vector store query mode",
+    )
+    parser.add_argument(
         "--debug", action="store_true", help="Print recency score calculation details"
     )
     return parser.parse_args()
@@ -27,17 +33,18 @@ async def main() -> None:
 
     tool.valves.qdrant_url = "http://localhost:6333"
     tool.valves.qdrant_collection_name = "ssaskb"
-    tool.valves.embed_rerank_url = "http://localhost:9000"
+    tool.valves.embed_rerank_url = "http://127.0.0.1:9997"
     tool.valves.embedding_model = "mlx-community/Qwen3-Embedding-4B-4bit-DWQ"
+    tool.valves.embedding_query_instruction = "Instruct: Given a query about subsidy scheme, application and employment policies, retrieve relevant document passages Query: "
     tool.valves.reranker_model = "reranker"
 
-    print("Provider: embed-rerank (localhost:9000)")
+    print("Provider: xinference (127.0.0.1:9997)")
     print(f"Query: {args.query}")
     print(f"Top-k: {args.top_k}")
     print()
 
     result = await tool.retrieve_documents(
-        args.query, top_k=args.top_k, debug_recency=args.debug
+        args.query, top_k=args.top_k, debug_recency=args.debug, mode=args.mode
     )
 
     print()

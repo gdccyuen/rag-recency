@@ -24,7 +24,7 @@ import re
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
@@ -61,11 +61,11 @@ DEBUG = True
 
 class EmbedRerankReranker(BaseNodePostprocessor):
     """
-    Reranker using an embed-rerank service (/v1/openai/rerank).
+    Reranker using a xinference service (/v1/openai/rerank).
     """
 
     top_n: int = Field(description="Number of top results to return")
-    base_url: str = Field(description="Base URL of the embed-rerank service")
+    base_url: str = Field(description="Base URL of the xinference service")
 
     @classmethod
     def class_name(cls) -> str:
@@ -74,17 +74,17 @@ class EmbedRerankReranker(BaseNodePostprocessor):
     def _postprocess_nodes(
         self,
         nodes: list[NodeWithScore],
-        query_bundle: Optional[QueryBundle] = None,
+        query_bundle: QueryBundle | None = None,
     ) -> list[NodeWithScore]:
         raise NotImplementedError
 
     async def _apostprocess_nodes(
         self,
         nodes: list[NodeWithScore],
-        query_bundle: Optional[QueryBundle] = None,
+        query_bundle: QueryBundle | None = None,
     ) -> list[NodeWithScore]:
         """
-        Rerank nodes using embed-rerank /v1/openai/rerank endpoint.
+        Rerank nodes using xinference /v1/openai/rerank endpoint.
         """
         if not nodes:
             return []
@@ -132,7 +132,7 @@ class RecencyBooster(BaseNodePostprocessor):
     halflife_days: float = Field(
         description="Half-life in days for Gaussian recency decay"
     )
-    reference_date: Optional[datetime] = Field(default=None)
+    reference_date: datetime | None = Field(default=None)
     debug: bool = Field(default=False)
 
     @classmethod
@@ -142,14 +142,14 @@ class RecencyBooster(BaseNodePostprocessor):
     def _postprocess_nodes(
         self,
         nodes: list[NodeWithScore],
-        query_bundle: Optional[QueryBundle] = None,
+        query_bundle: QueryBundle | None = None,
     ) -> list[NodeWithScore]:
         raise NotImplementedError
 
     async def _apostprocess_nodes(
         self,
         nodes: list[NodeWithScore],
-        query_bundle: Optional[QueryBundle] = None,
+        query_bundle: QueryBundle | None = None,
     ) -> list[NodeWithScore]:
         if not nodes:
             return []
@@ -187,22 +187,53 @@ class RecencyBooster(BaseNodePostprocessor):
 
 def get_embedding_model(
     embedding_model_name: str,
-    embedding_query_instruction: Optional[str],
+    embedding_query_instruction: str | None,
     embed_rerank_url: str,
 ) -> BaseEmbedding:
     """
     Initialize and return the model for embedding.
     """
+    query_instruction = None
     if embedding_query_instruction:
         query_instruction = str(embedding_query_instruction).strip()
-    else:
-        query_instruction = None
-    return OpenAIEmbedding(
+
+    base_model = OpenAIEmbedding(
         model_name=embedding_model_name,
         api_key="not-needed",
         api_base=f"{embed_rerank_url.rstrip('/')}/v1",
-        query_instruction=query_instruction,
     )
+
+    if query_instruction:
+        return InstructedEmbedding(base_model, query_instruction)
+    return base_model
+
+
+class InstructedEmbedding(BaseEmbedding):
+    """Wraps an embedding model to prepend a query instruction."""
+
+    _base_model: BaseEmbedding
+    _instruction: str
+
+    def __init__(self, base_model: BaseEmbedding, instruction: str) -> None:
+        super().__init__()
+        object.__setattr__(self, "_base_model", base_model)
+        object.__setattr__(self, "_instruction", instruction)
+
+    def _get_query_embedding(self, query: str) -> list[float]:
+        return self._base_model._get_query_embedding(self._instruction + query)
+
+    async def _aget_query_embedding(self, query: str) -> list[float]:
+        return await self._base_model._aget_query_embedding(self._instruction + query)
+
+    def _get_text_embedding(self, text: str) -> list[float]:
+        return self._base_model._get_text_embedding(text)
+
+    async def _aget_text_embedding(self, text: str) -> list[float]:
+        return await self._base_model._aget_text_embedding(text)
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "InstructedEmbedding"
 
 
 def get_reranker(
@@ -219,8 +250,8 @@ def get_vector_index(
     qdrant_url: str,
     qdrant_collection_name: str,
     embedding_model: str,
-    embedding_query_instruction: Optional[str],
-    qdrant_api_key: Optional[str],
+    embedding_query_instruction: str | None,
+    qdrant_api_key: str | None,
     embed_rerank_url: str,
 ) -> VectorStoreIndex:
     """
@@ -234,12 +265,14 @@ def get_vector_index(
         # Workaround for https://github.com/run-llama/llama_index/issues/20002
         QdrantVectorStore.use_old_sparse_encoder = lambda self, collection_name: False
     else:
-        kwargs = {"url": qdrant_url, "api_key": qdrant_api_key or ""}
+        aclient = AsyncQdrantClient(url=qdrant_url, api_key=qdrant_api_key or None)
+        kwargs = {"aclient": aclient}
 
     vector_store = QdrantVectorStore(
         collection_name=qdrant_collection_name,
         enable_hybrid=True,
-        fastembed_sparse_model="Qdrant/bm25",
+        # fastembed_sparse_model="Qdrant/bm25",  # Disabled to avoid FastEmbed import errors in Docker
+        # To re-enable BM25 sparse encoding, ensure fastembed is installed in your Docker environment
         **kwargs,
     )
 
@@ -267,7 +300,7 @@ def build_filters(file_name: str) -> MetadataFilters:
     )
 
 
-def get_node_page(node: NodeWithScore) -> Optional[int]:
+def get_node_page(node: NodeWithScore) -> int | None:
     """
     Return page number of Node.
     """
@@ -317,8 +350,13 @@ def clean_node(node: NodeWithScore, citation_id: int) -> dict:
         "total_pages",
         "headings",
     }
+    source_name = node.metadata.get("file_name", "Retrieved Document")
+    page = get_node_page(node)
+    if page:
+        source_name += f" - p. {page}"
     cleaned_node = {
         "id": citation_id,
+        "source": source_name,
         "id_": node.id_,
         "metadata": {
             k: v for k, v in node.metadata.items() if k in metadata_fields_to_keep
@@ -326,7 +364,6 @@ def clean_node(node: NodeWithScore, citation_id: int) -> dict:
         "text": clean_text(node.text),
         "score": node.score,
     }
-    page = get_node_page(node)
     if page:
         cleaned_node["metadata"]["page"] = page
     return cleaned_node
@@ -342,21 +379,24 @@ class CitationIndex:
         self, node: NodeWithScore, __event_emitter__: Callable[[dict], Any]
     ) -> None:
         source_name = node.metadata.get("file_name", "Retrieved Document")
-        source_name += f" ({node.id_})"
         page_number = get_node_page(node)
         if page_number:
             source_name += f" - p. {page_number}"
         await __event_emitter__(
             {
-                "type": "citation",
+                "type": "source",
                 "data": {
+                    "source": {
+                        "id": node.id_,
+                        "name": source_name,
+                    },
                     "document": [clean_text(node.text)],
                     "metadata": [
                         {
                             "source": source_name,
+                            "name": source_name,
                         }
                     ],
-                    "source": {"name": source_name},
                 },
             }
         )
@@ -364,8 +404,8 @@ class CitationIndex:
     async def add_if_not_exists(
         self,
         node: NodeWithScore,
-        __event_emitter__: Optional[Callable[[dict], Any]] = None,
-    ) -> Optional[int]:
+        __event_emitter__: Callable[[dict], Any] | None = None,
+    ) -> int | None:
         # Lock required to prevent race conditions in check-and-set operation
         # and to ensure citations are emitted in citation_id order.
         async with self._lock:
@@ -393,7 +433,7 @@ class Tools:
             default="llamacollection",
             description="Qdrant collection containing both dense vectors and sparse vectors.",
         )
-        qdrant_api_key: Optional[str] = Field(
+        qdrant_api_key: str | None = Field(
             default=None,
             description="API key for remote Qdrant instance.",
         )
@@ -401,17 +441,17 @@ class Tools:
             default="mlx-community/Qwen3-Embedding-4B-4bit-DWQ",
             description="Model for query embeddings, which should match the model used to create the text embeddings.",
         )
-        embedding_query_instruction: Optional[str] = Field(
+        embedding_query_instruction: str | None = Field(
             default=None,
             description="Instruction to prepend to query before embedding, e.g., 'query:'.",
         )
-        reranker_model: Optional[str] = Field(
+        reranker_model: str | None = Field(
             default="vserifsaglam/Qwen3-Reranker-4B-4bit-MLX",
             description="Model for reranking search results. When set, retrieves more candidates to improve quality.",
         )
         embed_rerank_url: str = Field(
-            default="http://localhost:9000",
-            description="URL for embed-rerank service. Uses /api/v1/embed for embedding and /api/v1/rerank for reranking.",
+            default="http://127.0.0.1:9997",
+            description="URL for xinference service providing embedding and reranking endpoints.",
         )
 
     def __init__(self) -> None:
@@ -429,10 +469,11 @@ class Tools:
         self,
         query: str,
         top_k: int = RESULTS_DEFAULT,
-        file_name: Optional[str] = None,
+        file_name: str | None = None,
         debug_recency: bool = False,
-        __metadata__: Optional[dict[str, Any]] = None,
-        __event_emitter__: Optional[Callable[[dict], Any]] = None,
+        mode: str = "hybrid",
+        __metadata__: dict[str, Any] | None = None,
+        __event_emitter__: Callable[[dict], Any] | None = None,
     ) -> str:
         """
         Retrieve relevant documents from the Qdrant vector store using hybrid search.
@@ -440,6 +481,7 @@ class Tools:
         :param query: Natural language search query
         :param top_k: Number of top documents to return
         :param file_name: Filename to optionally filter results by
+        :param mode: Vector store query mode (hybrid, dense, sparse)
         :param __metadata__: Injected by Open WebUI with information about the chat
         :param __event_emitter__: Injected by Open WebUI to send events to the frontend
         """
@@ -507,7 +549,7 @@ class Tools:
 
             # Create a query engine with hybrid search mode and async execution.
             retriever = self._index.as_retriever(
-                vector_store_query_mode="hybrid",
+                vector_store_query_mode=mode,
                 similarity_top_k=num_candidates,
                 filters=parsed_filters,
                 use_async=True,
@@ -521,6 +563,9 @@ class Tools:
                     f"[DEBUG] Retrieve: {time.time() - t0:.2f}s, "
                     f"{len(nodes)} candidates"
                 )
+                for i, node in enumerate(nodes[:10]):
+                    file_name = node.metadata.get("file_name", "unknown")
+                    print(f"[VECTOR] #{i + 1} {file_name:50s} | score={node.score:.6f}")
 
             # Rerank if reranker model is configured.
             if self.valves.reranker_model and nodes:
@@ -538,6 +583,11 @@ class Tools:
                     print(
                         f"[DEBUG] Rerank: {time.time() - t0:.2f}s, {len(nodes)} results"
                     )
+                    for i, node in enumerate(nodes):
+                        file_name = node.metadata.get("file_name", "unknown")
+                        print(
+                            f"[RERANK] #{i + 1} {file_name:50s} | score={node.score:.6f}"
+                        )
 
             # Apply recency boost.
             if nodes:
